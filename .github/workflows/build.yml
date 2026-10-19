@@ -1,0 +1,320 @@
+name: Build APK
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: 8.7
+      - name: Create project files
+        run: |
+          mkdir -p app/src/main/java/com/example/notifforwarder
+          cat > settings.gradle.kts <<'EOF_FILE'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "NotifForwarder"
+          include(":app")
+          EOF_FILE
+          cat > build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_FILE
+          cat > gradle.properties <<'EOF_FILE'
+          org.gradle.jvmargs=-Xmx2048m
+          android.useAndroidX=true
+          kotlin.code.style=official
+          EOF_FILE
+          cat > app/build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.example.notifforwarder"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.notifforwarder"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+
+          dependencies {
+              implementation("com.squareup.okhttp3:okhttp:4.12.0")
+          }
+          EOF_FILE
+          cat > app/src/main/AndroidManifest.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+
+              <queries>
+                  <intent>
+                      <action android:name="android.intent.action.MAIN" />
+                      <category android:name="android.intent.category.LAUNCHER" />
+                  </intent>
+              </queries>
+
+              <application
+                  android:label="Notif"
+                  android:theme="@android:style/Theme.Material"
+                  android:usesCleartextTraffic="false">
+
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".NotifService"
+                      android:exported="true"
+                      android:label="Notif"
+                      android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.service.notification.NotificationListenerService" />
+                      </intent-filter>
+                  </service>
+              </application>
+          </manifest>
+          EOF_FILE
+          cat > app/src/main/java/com/example/notifforwarder/MainActivity.kt <<'EOF_FILE'
+          package com.example.notifforwarder
+
+          import android.app.Activity
+          import android.app.AlertDialog
+          import android.content.Intent
+          import android.graphics.Color
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.text.InputType
+          import android.view.View
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.Toast
+          import okhttp3.Call
+          import okhttp3.Callback
+          import okhttp3.MediaType.Companion.toMediaType
+          import okhttp3.OkHttpClient
+          import okhttp3.Request
+          import okhttp3.RequestBody.Companion.toRequestBody
+          import okhttp3.Response
+          import org.json.JSONObject
+          import java.io.IOException
+
+          class MainActivity : Activity() {
+
+              private val client = OkHttpClient()
+              private lateinit var urlField: EditText
+              private lateinit var pkgField: EditText
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val prefs = getSharedPreferences("cfg", MODE_PRIVATE)
+                  val pad = (16 * resources.displayMetrics.density).toInt()
+
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(pad, pad, pad, pad)
+                      setBackgroundColor(Color.BLACK)
+                  }
+
+                  urlField = EditText(this).apply {
+                      hint = "Webhook URL (https://...)"
+                      inputType = InputType.TYPE_TEXT_VARIATION_URI
+                      setText(prefs.getString("url", ""))
+                      setTextColor(Color.WHITE)
+                      setHintTextColor(Color.GRAY)
+                  }
+                  pkgField = EditText(this).apply {
+                      hint = "Package (কমা দিয়ে)। খালি = সব অ্যাপ"
+                      setText(prefs.getString("pkgs", ""))
+                      setTextColor(Color.WHITE)
+                      setHintTextColor(Color.GRAY)
+                      visibility = View.GONE
+                  }
+
+                  val lp = LinearLayout.LayoutParams(
+                      LinearLayout.LayoutParams.MATCH_PARENT,
+                      LinearLayout.LayoutParams.WRAP_CONTENT
+                  ).apply { topMargin = pad / 2 }
+
+                  root.addView(urlField, lp)
+                  root.addView(pkgField, lp)
+                  root.addView(button("Choice") { chooseApps() }, lp)
+                  root.addView(button("Save") { save(true) }, lp)
+                  root.addView(button("Test") { sendTest() }, lp)
+                  root.addView(button("Notification Access চালু করুন") {
+                      startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+                  }, lp)
+                  root.addView(button("Battery Optimization সেটিংস") {
+                      startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+                  }, lp)
+
+                  val scroll = ScrollView(this).apply {
+                      setBackgroundColor(Color.BLACK)
+                      isFillViewport = true
+                      addView(root)
+                  }
+                  setContentView(scroll)
+              }
+
+              private fun button(label: String, onClick: () -> Unit): Button {
+                  return Button(this).apply {
+                      text = label
+                      setTextColor(Color.WHITE)
+                      setBackgroundColor(0xFF333333.toInt())
+                      setOnClickListener { onClick() }
+                  }
+              }
+
+              private fun save(showToast: Boolean) {
+                  getSharedPreferences("cfg", MODE_PRIVATE).edit()
+                      .putString("url", urlField.text.toString().trim())
+                      .putString("pkgs", pkgField.text.toString().trim())
+                      .apply()
+                  if (showToast) toast("Saved")
+              }
+
+              private fun toast(msg: String) {
+                  Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+              }
+
+              private fun chooseApps() {
+                  val pm = packageManager
+                  val main = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+                  val apps = pm.queryIntentActivities(main, 0)
+                      .map { Pair(it.loadLabel(pm).toString(), it.activityInfo.packageName) }
+                      .filter { it.second != packageName }
+                      .distinctBy { it.second }
+                      .sortedBy { it.first.lowercase() }
+
+                  val selected = pkgField.text.toString()
+                      .split(",").map { it.trim() }.filter { it.isNotEmpty() }.toMutableSet()
+                  val names = apps.map { it.first }.toTypedArray()
+                  val checked = BooleanArray(apps.size) { apps[it].second in selected }
+
+                  AlertDialog.Builder(this)
+                      .setTitle("Choice")
+                      .setMultiChoiceItems(names, checked) { _, i, isChecked ->
+                          if (isChecked) selected.add(apps[i].second) else selected.remove(apps[i].second)
+                      }
+                      .setPositiveButton("OK") { _, _ ->
+                          pkgField.setText(selected.joinToString(","))
+                          save(true)
+                      }
+                      .setNegativeButton("Cancel", null)
+                      .show()
+              }
+
+              private fun sendTest() {
+                  save(false)
+                  val url = urlField.text.toString().trim()
+                  if (url.isEmpty()) {
+                      toast("আগে URL দিন")
+                      return
+                  }
+                  val json = JSONObject().apply {
+                      put("app", "test")
+                      put("title", "Test")
+                      put("text", "Test notification")
+                  }
+                  val req = try {
+                      Request.Builder().url(url)
+                          .post(json.toString().toRequestBody("application/json".toMediaType()))
+                          .build()
+                  } catch (ex: Exception) {
+                      toast("URL ঠিক নেই")
+                      return
+                  }
+                  client.newCall(req).enqueue(object : Callback {
+                      override fun onFailure(call: Call, e: IOException) {
+                          runOnUiThread { toast("Failed: " + e.message) }
+                      }
+
+                      override fun onResponse(call: Call, response: Response) {
+                          val code = response.code
+                          response.close()
+                          runOnUiThread { toast("Sent, code " + code) }
+                      }
+                  })
+              }
+          }
+          EOF_FILE
+          cat > app/src/main/java/com/example/notifforwarder/NotifService.kt <<'EOF_FILE'
+          package com.example.notifforwarder
+
+          import android.app.Notification
+          import android.service.notification.NotificationListenerService
+          import android.service.notification.StatusBarNotification
+          import okhttp3.*
+          import okhttp3.MediaType.Companion.toMediaType
+          import okhttp3.RequestBody.Companion.toRequestBody
+          import org.json.JSONObject
+          import java.io.IOException
+
+          class NotifService : NotificationListenerService() {
+
+              private val client = OkHttpClient()
+
+              override fun onNotificationPosted(sbn: StatusBarNotification) {
+                  if (sbn.packageName == packageName) return
+                  if (sbn.notification.flags and Notification.FLAG_GROUP_SUMMARY != 0) return
+
+                  val prefs = getSharedPreferences("cfg", MODE_PRIVATE)
+                  val url = prefs.getString("url", "").orEmpty()
+                  if (url.isBlank()) return
+
+                  val allowed = prefs.getString("pkgs", "").orEmpty()
+                      .split(",").map { it.trim() }.filter { it.isNotEmpty() }
+                  if (allowed.isNotEmpty() && sbn.packageName !in allowed) return
+
+                  val e = sbn.notification.extras
+                  val json = JSONObject().apply {
+                      put("app", sbn.packageName)
+                      put("title", e.getCharSequence(Notification.EXTRA_TITLE)?.toString())
+                      put("text", e.getCharSequence(Notification.EXTRA_TEXT)?.toString())
+                      put("time", sbn.postTime)
+                  }
+
+                  val req = Request.Builder()
+                      .url(url)
+                      .post(json.toString().toRequestBody("application/json".toMediaType()))
+                      .build()
+
+                  client.newCall(req).enqueue(object : Callback {
+                      override fun onFailure(call: Call, e: IOException) {}
+                      override fun onResponse(call: Call, response: Response) { response.close() }
+                  })
+              }
+          }
+          EOF_FILE
+      - run: gradle assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-debug
+          path: app/build/outputs/apk/debug/app-debug.apk
